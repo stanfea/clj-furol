@@ -2,6 +2,7 @@
   (:require [clojure.data.csv :as csv]
             [clojure.java.io :as io]
             [clojure.string :as string]
+            [clojure.core.async :refer [close! chan <! >! >!! <!! go go-loop]]
             [clojure.core.match :refer [match]]
             [clojure.tools.cli :refer [parse-opts]]
             [clojure.java.jdbc :refer [execute! create-table-ddl get-connection insert-multi!]]
@@ -12,14 +13,29 @@
             [taoensso.timbre.profiling :as profiling
              :refer (pspy pspy* profile defnp p p*)])
   (:import org.apache.commons.io.FilenameUtils
-           org.fusesource.hawtjni.runtime.Library)
+           org.fusesource.hawtjni.runtime.Library
+           java.util.concurrent.Executors)
   (:gen-class))
+
+
+(deref (ref "test"))
+
+
 
 (def m {:Timestamp 0 :SecurityID 1 :Ticker 2 :Type 3 :Side 4 :Level 5 :Quantity 6 :Price 7 :OrderCount 8 :Flags 9})
 
-(def table-columns [[:id :int "IDENTITY(1,1) PRIMARY KEY"] [:ctimestamp :bigint] [:csecurityid :int] [:cticker :text] [:csellhigh :bigint]
+(def table-columns [[:id :int "IDENTITY(1,1) PRIMARY KEY"] [:ctimestamp :bigint] [:csecurityid :int] [:cticker "VARCHAR(20) CONSTRAINT UNIQUE KEY `uc_log` (`ctimestamp`, `cticker`,`csecurityid`)"]
+                    [:csellhigh :bigint]
                     [:cselllow :bigint] [:csellopen :bigint] [:csellclose :bigint] [:cbuyhigh :bigint] [:cbuylow :bigint]
                     [:cbuyopen :bigint] [:cbuyclose :bigint] [:chigh :bigint] [:clow :bigint] [:copen :bigint] [:cclose :bigint]])
+
+
+(defn table-spec [table] (format "CREATE TABLE %s (id int IDENTITY(1,1) PRIMARY KEY, ctimestamp bigint, csecurityid int, cticker VARCHAR(20), csellhigh bigint,
+                                 cselllow bigint, csellopen bigint, csellclose bigint, cbuyhigh bigint, cbuylow bigint,
+                                 cbuyopen bigint, cbuyclose bigint, chigh bigint, clow bigint, copen bigint, cclose bigint,
+                                 CONSTRAINT uc_log UNIQUE(ctimestamp,cticker,csecurityid))" table))
+
+
 
 (defn middle [price1 price2]
   (long (/ (+ price1 price2) 2)))
@@ -82,21 +98,26 @@
 (def cli-options
   [["-i" "--dir INPUTDIR" "Input directory"
     :validate [#(.exists (io/file %)) "Input dir must exist"]]
-   ["-s" "--server-name localhost\\sqlexpress" "database host"
-    :default "localhost\\sqlexpress"]
+
    ["-d" "--database futures" "database name"]
    ["-t" "--table hourly" "database table"]
-   ["-u" "--user admin" "sql username"]
-   ["-p" "--pass secret123" "sql password"]
-   ["-n" "--precision 10" "number of digits to keep in timestamp"
+   [nil "--server-name localhost\\sqlexpress" "database host"
+    :default "localhost\\sqlexpress"]
+   [nil "--user admin" "sql username"]
+   [nil "--pass secret123" "sql password"]
+   [nil "--precision 10" "number of digits to keep in timestamp"
     :parse-fn #(Integer/parseInt %)
     :default 10]
+   [nil "--processed-dir inputdir/processed" "Move processed files to this directory"]
+   [nil "--batchsize 10000" "how many rows to insert at a time to sql server"
+    :parse-fn #(Integer/parseInt %)
+    :default 10000]
    [nil "--port 1433" "database port"
     :parse-fn #(Integer/parseInt %)
     :default 1433]
-   ;;    [nil "--threads nthreads" "number of files to process at a time"
-   ;;     :parse-fn #(Integer/parseInt %)
-   ;;     :default 1]
+   [nil "--threads nthreads" "number of files to process at a time"
+    :parse-fn #(Integer/parseInt %)
+    :default 3]
    ["-h" "--help"]])
 
 (defn usage [options-summary]
@@ -120,46 +141,132 @@
   (println msg)
   (System/exit status))
 
+
+;; (defn relay [x i]
+;;   (when (:next x)
+;;     (send (:next x) relay i))
+;;   (when (and (zero? i) (:report-queue x))
+;;     (.put (:report-queue x) i))
+;;   x)
+
+;; (defn run [m n]
+;;   (let [q (new java.util.concurrent.SynchronousQueue)
+;;         hd (reduce (fn [next _] (agent {:next next}))
+;;                    (agent {:report-queue q}) (range (dec m)))]
+;;     (doseq [i (reverse (range n))]
+;;       (send hd relay i))
+;;     (.take q)))
+
+;; (defn pmapn [n f coll]
+;;   (let [rets (map #(future (f %)) coll)
+;;         step (fn step [[x & xs :as vs] fs]
+;;                (lazy-seq
+;;                  (if-let [s (seq fs)]
+;;                    (cons (deref x) (step xs (rest s)))
+;;                    (map deref vs))))]
+;;     (step rets (drop n rets))))
+
+(defn get-files [dir extension & {:keys [recursive?] :or {:recursive? false}}]
+  (let [listfn (if recursive? file-seq #(.listFiles %))]
+    (->> dir
+         io/file
+         listfn
+         seq
+         (map str)
+         (filter #(= extension (FilenameUtils/getExtension %))))))
+
+(defn try-times*
+  "Executes thunk. If an exception is thrown, will retry. At most n retries
+  are done. If still some exception is thrown it is bubbled upwards in
+  the call chain."
+  [n thunk]
+  (loop [n n]
+    (if-let [result (try
+                      [(thunk)]
+                      (catch Exception e
+                        (if (not (= -1 (.indexOf (.getMessage e) "PRIMARY")))
+                          (when (zero? n)
+                            (throw e))
+                          (fn [x] 0))))]
+      (result 0)
+      (do (Thread/sleep 3000)
+        (recur (dec n))))))
+
+(defmacro try-times
+  "Executes body. If an exception is thrown, will retry. At most n retries
+  are done. If still some exception is thrown it is bubbled upwards in
+  the call chain."
+  [n & body]
+  `(try-times* ~n (fn [] ~@body)))
+
+;; (defn db-insert [db table headers data & {:keys [retry] :or {:retry 10}}]
+;;   (insert-multi! db table headers data))
+;;   (try
+;;     (try-times retry  (insert-multi! db table headers data))
+;;     (catch Throwable t (error t) (throw t))))
+
+(defn make-db-spec [server-name port database user pass]
+  (if (some nil? [user pass])
+    {:classname "com.microsoft.jdbc.sqlserver.SQLServerDriver"
+     :subprotocol "sqlserver"
+     :subname (str "//" server-name ":" port ";databasename=" database ";integratedSecurity=true")}
+    {:classname "com.microsoft.jdbc.sqlserver.SQLServerDriver"
+     :subprotocol "sqlserver"
+     :subname (str "//" server-name ":" port ";databasename=" database "user=" user "password=" pass)}))
+
+
 (defn -main [& args]
-  (Library. "jdbc_auth" nil (.getContextClassLoader (Thread/currentThread)))
-  (let [{:keys [options arguments errors summary]} (parse-opts args cli-options)
-        {:keys [dir server-name precision database table user pass port]} options]
-    (cond
-      (:help options) (exit 0 (usage summary))
-      (missing-required? options) (exit 0 (usage summary))
-      errors (exit 1 (error-msg errors)))
-    (let [db  (if (some nil? [user pass])
-                {:classname "com.microsoft.jdbc.sqlserver.SQLServerDriver"
-                 :subprotocol "sqlserver"
-                 :subname (str "//" server-name ":" port ";databasename=" database ";integratedSecurity=true")}
-                {:classname "com.microsoft.jdbc.sqlserver.SQLServerDriver"
-                 :subprotocol "sqlserver"
-                 :subname (str "//" server-name ":" port ";databasename=" database "user=" user "password=" pass)})
-          conn (get-connection db)
-          query (create-table-ddl (keyword table) table-columns)
-          _ (try (execute! db query) (catch Exception e)) ;catch exception if table already exists
-          files
-          (->> dir
-               io/file
-               file-seq
-               rest
-               (map str)
-               (filter #(.endsWith % ".csv")))
-          nfiles (count files)
-          i (atom 0)
-          log-progress #(do (swap! i inc) (info (format "progress: %.2f%%" (float (/ (* @i 100) nfiles)))))
-          headers (->> table-columns rest (map #(nth % 0)))]
-      (pr-str headers)
-      (->> files
-           (map (fn [fpath]
-                  (info "processing:" fpath)
-                  (let [basename (FilenameUtils/getBaseName fpath)]
-                    (try
+  (try
+    (.load (Library. "sqljdbc_auth"))
+    (let [{:keys [options arguments errors summary]} (parse-opts args cli-options)
+          {:keys [dir threads server-name processed-dir precision batchsize database table user pass port]} options]
+      (cond
+        (:help options) (exit 0 (usage summary))
+        (missing-required? options) (exit 0 (usage summary))
+        errors (exit 1 (error-msg errors)))
+      (let [processed-dir (or processed-dir (str (io/file dir "processed")))
+            _ (.mkdir (io/file processed-dir))
+            sql-queue (chan)
+            db (make-db-spec server-name port database user pass)
+            conn (get-connection db)
+            query (try (execute! db (table-spec table)) (catch Throwable e (warn "Table" table "exists already")))
+            files (get-files dir "csv")
+            nfiles (count files)
+            headers (->> table-columns rest (map #(nth % 0)))
+            pool (Executors/newFixedThreadPool threads)
+            i (atom 0)]
+        (go-loop [[ack-chan batch] (<! sql-queue)]
+                 (when (not (nil? batch))
+                   (try-times 10 (insert-multi! db table headers batch))
+                   (close! ack-chan)
+                   (recur (<! sql-queue))))
+        (->> files
+             (map (fn [fpath]
+                    (fn []
+                      (locking *out*
+                        (info "processing:" fpath))
                       (with-open [in (io/reader fpath)]
-                        (->> (doseq [batch (partition-all 1000 (process precision in))]
-                               (insert-multi! db table headers batch))
-                             doall)
-                        (log-progress))
-                      (catch Throwable t (error t))))))
-           doall))))
+                        (let [filename (FilenameUtils/getName fpath)]
+                          (->>
+                            in
+                            (process precision)
+                            (partition-all batchsize)
+                            (map (fn [batch]
+                                   (let [ack-chan (chan)
+                                         batch (doall batch)]
+                                     (go (>! sql-queue [ack-chan batch]))
+                                     ack-chan)))
+                            (map #(<!! %))
+                            doall)))
+                      ;;           (if (not (.renameTo (io/file fpath) (io/file processed-dir (FilenameUtils/getName fpath))))
+                      ;;             (throw (Exception. (format "Couldn't move %s to %s" fpath  (str (io/file processed-dir (FilenameUtils/getName fpath)))))))
+                      (locking *out*
+                        (swap! i inc)
+                        (info (format "progress: %.2f%%" (float (/ (* @i 100) nfiles))))))))
+             (.invokeAll pool)
+             (map #(.get %))
+             doall)
+        (close! sql-queue)
+        (.shutdown pool)))
+    (catch Throwable t (error t) (throw t))))
 
