@@ -18,24 +18,28 @@
   (:gen-class))
 
 
-(deref (ref "test"))
-
-
-
 (def m {:Timestamp 0 :SecurityID 1 :Ticker 2 :Type 3 :Side 4 :Level 5 :Quantity 6 :Price 7 :OrderCount 8 :Flags 9})
 
-(def table-columns [[:id :int "IDENTITY(1,1) PRIMARY KEY"] [:ctimestamp :bigint] [:csecurityid :int] [:cticker "VARCHAR(20) CONSTRAINT UNIQUE KEY `uc_log` (`ctimestamp`, `cticker`,`csecurityid`)"]
-                    [:csellhigh :bigint]
-                    [:cselllow :bigint] [:csellopen :bigint] [:csellclose :bigint] [:cbuyhigh :bigint] [:cbuylow :bigint]
-                    [:cbuyopen :bigint] [:cbuyclose :bigint] [:chigh :bigint] [:clow :bigint] [:copen :bigint] [:cclose :bigint]])
-
+(def table-columns [:ctimestamp :csecurityid :cticker :csellhigh :cselllow :csellopen :csellclose :cbuyhigh :cbuylow :cbuyopen :cbuyclose :chigh:clow :copen :cclose])
 
 (defn table-spec [table] (format "CREATE TABLE %s (id int IDENTITY(1,1) PRIMARY KEY, ctimestamp bigint, csecurityid int, cticker VARCHAR(20), csellhigh bigint,
                                  cselllow bigint, csellopen bigint, csellclose bigint, cbuyhigh bigint, cbuylow bigint,
                                  cbuyopen bigint, cbuyclose bigint, chigh bigint, clow bigint, copen bigint, cclose bigint,
                                  CONSTRAINT uc_log UNIQUE(ctimestamp,cticker,csecurityid))" table))
 
+(def weekdays {1 :monday 2 :tuesday 3 :wednesday 4 :thursday 5 :friday 6 :saturday 7 :sunday})
 
+
+(defn trading-hours? [{:keys [timestamp] :as record}]
+  (let [ct-datetime (t/to-time-zone (f/parse (f/formatter "yyyyMMddHH") timestamp) (t/time-zone-for-id "America/Chicago"))
+        weekday (->> ct-datetime .dayOfWeek .get weekdays)
+        hour (.getHourOfDay ct-datetime)]
+    (cond
+      (= :saturday weekday) false
+      (and (= :friday weekday) (>= hour 16)) false
+      (and (= :sunday weekday) (< hour 17)) false
+      (= 16 hour) false
+      :else true)))
 
 (defn middle [price1 price2]
   (long (/ (+ price1 price2) 2)))
@@ -45,11 +49,10 @@
   (->> coll
        rest
        (reduce (fn [[current-min current-max] v]
-                 (if (< v current-min)
-                   [v current-max]
-                   (if (> v current-max)
-                     [current-min v]
-                     [current-min current-max]))) [(first coll) (first coll)])))
+                 (cond
+                   (< v current-min) [v current-max]
+                   (> v current-max) [current-min v]
+                   :else [current-min current-max])) [(first coll) (first coll)])))
 
 (defn calc [rows]
   (let [prices (map :price rows)
@@ -69,15 +72,24 @@
                        buy (calc buy)]
                    (concat timestampsecidticker sell buy (map #(middle %1 %2) sell buy))))))
 
+
+(defn add-date-time [{:keys [ctimestamp] :as record}]
+  (->> ctimestamp
+       str
+       (f/parse (f/formatter "yyyyMMddHH"))
+
+
 (defn process [precision reader]
   (let [data (csv/read-csv reader)
         rows (->> data rest (filter #(contains? #{"161" "97"} (nth % (m :Type))))
                   (map (fn [[Timestamp SecurityID Ticker Type Side Level Quantity Price OrderCount Flag]]
-                         {:timestamp (Long/parseLong (subs Timestamp 0 precision))
+                         {:timestamp (subs Timestamp 0 precision)
                           :secid (Integer/parseInt SecurityID)
                           :ticker Ticker
                           :type (if (= "97" Type) :sell :buy)
-                          :price (Long/parseLong Price)})))
+                          :price (Long/parseLong Price)}))
+                  (filter trading-hours?)
+                  (map (partial update-in :timestamp #(Long/parseLong %))))
         partitions (partition-by :timestamp rows)]
     (->> partitions
          (mapcat (fn [partition]
@@ -142,30 +154,6 @@
   (System/exit status))
 
 
-;; (defn relay [x i]
-;;   (when (:next x)
-;;     (send (:next x) relay i))
-;;   (when (and (zero? i) (:report-queue x))
-;;     (.put (:report-queue x) i))
-;;   x)
-
-;; (defn run [m n]
-;;   (let [q (new java.util.concurrent.SynchronousQueue)
-;;         hd (reduce (fn [next _] (agent {:next next}))
-;;                    (agent {:report-queue q}) (range (dec m)))]
-;;     (doseq [i (reverse (range n))]
-;;       (send hd relay i))
-;;     (.take q)))
-
-;; (defn pmapn [n f coll]
-;;   (let [rets (map #(future (f %)) coll)
-;;         step (fn step [[x & xs :as vs] fs]
-;;                (lazy-seq
-;;                  (if-let [s (seq fs)]
-;;                    (cons (deref x) (step xs (rest s)))
-;;                    (map deref vs))))]
-;;     (step rets (drop n rets))))
-
 (defn get-files [dir extension & {:keys [recursive?] :or {:recursive? false}}]
   (let [listfn (if recursive? file-seq #(.listFiles %))]
     (->> dir
@@ -180,17 +168,21 @@
   are done. If still some exception is thrown it is bubbled upwards in
   the call chain."
   [n thunk]
-  (loop [n n]
+  (loop [n n
+         sleep 100]
     (if-let [result (try
                       [(thunk)]
                       (catch Exception e
+                        (warn e)
                         (if (not (= -1 (.indexOf (.getMessage e) "PRIMARY")))
                           (when (zero? n)
                             (throw e))
                           (fn [x] 0))))]
       (result 0)
-      (do (Thread/sleep 3000)
-        (recur (dec n))))))
+      (do
+        (warn "sleeping for" sleep "ms before retrying...")
+        (Thread/sleep sleep)
+        (recur (dec n) (+ sleep 100))))))
 
 (defmacro try-times
   "Executes body. If an exception is thrown, will retry. At most n retries
@@ -198,12 +190,6 @@
   the call chain."
   [n & body]
   `(try-times* ~n (fn [] ~@body)))
-
-;; (defn db-insert [db table headers data & {:keys [retry] :or {:retry 10}}]
-;;   (insert-multi! db table headers data))
-;;   (try
-;;     (try-times retry  (insert-multi! db table headers data))
-;;     (catch Throwable t (error t) (throw t))))
 
 (defn make-db-spec [server-name port database user pass]
   (if (some nil? [user pass])
@@ -237,7 +223,7 @@
             i (atom 0)]
         (go-loop [[ack-chan batch] (<! sql-queue)]
                  (when (not (nil? batch))
-                   (try-times 10 (insert-multi! db table headers batch))
+                   (try-times 100 (insert-multi! db table headers batch))
                    (close! ack-chan)
                    (recur (<! sql-queue))))
         (->> files
@@ -258,8 +244,8 @@
                                      ack-chan)))
                             (map #(<!! %))
                             doall)))
-                      ;;           (if (not (.renameTo (io/file fpath) (io/file processed-dir (FilenameUtils/getName fpath))))
-                      ;;             (throw (Exception. (format "Couldn't move %s to %s" fpath  (str (io/file processed-dir (FilenameUtils/getName fpath)))))))
+                      (if (not (.renameTo (io/file fpath) (io/file processed-dir (FilenameUtils/getName fpath))))
+                        (throw (Exception. (format "Couldn't move %s to %s" fpath  (str (io/file processed-dir (FilenameUtils/getName fpath)))))))
                       (locking *out*
                         (swap! i inc)
                         (info (format "progress: %.2f%%" (float (/ (* @i 100) nfiles))))))))

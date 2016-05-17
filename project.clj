@@ -10,11 +10,12 @@
                  [commons-io/commons-io "2.4"]
                  [org.clojure/java.jdbc "0.6.0-alpha1"]
                  [org.clojure/core.match "0.3.0-alpha4"]
+                 [org.clojure/core.async "0.2.374"]
                  [org.clojure/tools.cli "0.3.3"]
                  [org.fusesource.hawtjni/hawtjni-runtime "1.11"]
                  [sqljdbc/sqljdbc "4.0"]]
   :main ^:skip-aot furol.core
   :target-path "target/%s"
   :uberjar-name "furol.jar"
-  :jvm-opts ["-Xmx3g" "-Djava.library.path=resources/META-INF/windows64"]
+  :jvm-opts ["-Djava.library.path=resources/META-INF/windows64"]
   :profiles {:uberjar {:aot :all}})
